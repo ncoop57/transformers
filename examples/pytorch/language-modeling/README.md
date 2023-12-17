@@ -72,6 +72,35 @@ python run_clm_no_trainer.py \
     --model_name_or_path gpt2 \
     --output_dir /tmp/test-clm
 ```
+pip install causal-conv1d<=1.0.2
+pip install mamba-ssm
+```bash
+python train_mamba_code.py \
+    --dataset_name bigcode/the-stack-smol \
+    --dataset_data_dir data/python \
+    --per_device_train_batch_size 1 \
+    --per_device_eval_batch_size 1 \
+    --model_name_or_path state-spaces/mamba-2.8b-slimpj \
+    --tokenizer_name EleutherAI/gpt-neox-20b \
+    --block_size 512 \
+    --output_dir /fsx/ckpts/mamba-code/mamba-2.8b-slimpj-test
+```
+
+```bash
+accelerate launch \
+    train_mamba_code.py \
+    --dataset_name bigcode/the-stack-smol \
+    --dataset_data_dir data/python \
+    --per_device_train_batch_size 2 \
+    --per_device_eval_batch_size 2 \
+    --with_tracking \
+    --report_to wandb \
+    --checkpointing_steps 50 \
+    --model_name_or_path state-spaces/mamba-2.8b-slimpj \
+    --tokenizer_name EleutherAI/gpt-neox-20b \
+    --block_size 2048 \
+    --output_dir /fsx/ckpts/mamba-code/mamba-2.8b-slimpj-code-test
+```
 
 ### RoBERTa/BERT/DistilBERT and masked language modeling
 
