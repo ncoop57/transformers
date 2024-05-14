@@ -476,6 +476,7 @@ _import_structure = {
     "models.levit": ["LevitConfig"],
     "models.lilt": ["LiltConfig"],
     "models.llama": ["LlamaConfig"],
+    "models.neobert": ["NeoBERTConfig"],
     "models.llava": [
         "LlavaConfig",
         "LlavaProcessor",
@@ -2271,6 +2272,15 @@ else:
             "LlamaForSequenceClassification",
             "LlamaModel",
             "LlamaPreTrainedModel",
+        ]
+    )
+    _import_structure["models.neobert"].extend(
+        [
+            "NeoBERTForCausalLM",
+            "NeoBERTForQuestionAnswering",
+            "NeoBERTForSequenceClassification",
+            "NeoBERTModel",
+            "NeoBERTPreTrainedModel",
         ]
     )
     _import_structure["models.llava"].extend(
@@ -4414,6 +4424,7 @@ else:
     )
     _import_structure["models.gptj"].extend(["FlaxGPTJForCausalLM", "FlaxGPTJModel", "FlaxGPTJPreTrainedModel"])
     _import_structure["models.llama"].extend(["FlaxLlamaForCausalLM", "FlaxLlamaModel", "FlaxLlamaPreTrainedModel"])
+    _import_structure["models.neobert"].extend(["FlaxNeoBERTForCausalLM", "FlaxNeoBERTModel", "FlaxNeoBERTPreTrainedModel"])
     _import_structure["models.gemma"].extend(["FlaxGemmaForCausalLM", "FlaxGemmaModel", "FlaxGemmaPreTrainedModel"])
     _import_structure["models.longt5"].extend(
         [
@@ -4999,6 +5010,7 @@ if TYPE_CHECKING:
     from .models.levit import LevitConfig
     from .models.lilt import LiltConfig
     from .models.llama import LlamaConfig
+    from .models.neobert import NeoBERTConfig
     from .models.llava import (
         LlavaConfig,
         LlavaProcessor,
@@ -6641,6 +6653,13 @@ if TYPE_CHECKING:
             LlamaForSequenceClassification,
             LlamaModel,
             LlamaPreTrainedModel,
+        )
+        from .models.neobert import (
+            NeoBERTForCausalLM,
+            NeoBERTForQuestionAnswering,
+            NeoBERTForSequenceClassification,
+            NeoBERTModel,
+            NeoBERTPreTrainedModel,
         )
         from .models.llava import (
             LlavaForConditionalGeneration,
@@ -8379,6 +8398,11 @@ if TYPE_CHECKING:
             FlaxLlamaForCausalLM,
             FlaxLlamaModel,
             FlaxLlamaPreTrainedModel,
+        )
+        from .models.neobert import (
+            FlaxNeoBERTForCausalLM,
+            FlaxNeoBERTModel,
+            FlaxNeoBERTPreTrainedModel,
         )
         from .models.longt5 import (
             FlaxLongT5ForConditionalGeneration,
