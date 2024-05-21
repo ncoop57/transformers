@@ -675,7 +675,7 @@ class NeoBERTSdpaAttention(NeoBERTAttention):
 
         # We dispatch to SDPA's Flash Attention or Efficient kernels via this if statement instead of an
         # inline conditional assignment to support both torch.compile's `dynamic=True` and `fullgraph=True`
-        is_causal = False if attention_mask is None and q_len > 1 else False
+        is_causal = False # if attention_mask is None and q_len > 1 else False
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
@@ -1047,78 +1047,88 @@ class NeoBERTModel(NeoBERTPreTrainedModel):
         cache_position: torch.Tensor,
         past_key_values: Cache,
     ):
-        # TODO: As of torch==2.2.0, the `attention_mask` passed to the model in `generate` is 2D and of dynamic length even when the static
-        # KV cache is used. This is an issue for torch.compile which then recaptures cudagraphs at each decode steps due to the dynamic shapes.
-        # (`recording cudagraph tree for symint key 13`, etc.), which is VERY slow. A workaround is `@torch.compiler.disable`, but this prevents using
-        # `fullgraph=True`. See more context in https://github.com/huggingface/transformers/pull/29114
-
+        # modifications from: https://github.com/McGill-NLP/llm2vec/blob/main/llm2vec/models/bidirectional_llama.py#L110
         if self.config._attn_implementation == "flash_attention_2":
             if attention_mask is not None and 0.0 in attention_mask:
                 return attention_mask
             return None
 
-        # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument, in
-        # order to dispatch on Flash Attention 2. This feature is not compatible with static cache, as SDPA will fail
-        # to infer the attention mask.
-        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-        using_static_cache = isinstance(past_key_values, StaticCache)
-        if self.config._attn_implementation == "sdpa" and not using_static_cache:
-            if AttentionMaskConverter._ignore_causal_mask_sdpa(
-                attention_mask,
-                inputs_embeds=input_tensor,
-                past_key_values_length=past_seen_tokens,
-                is_training=self.training,
-            ):
-                return None
+        # if is_transformers_attn_greater_or_equal_4_40() and self.config._attn_implementation == "sdpa":
+        #     # For SDPA, when possible, we will rely on its `is_causal` argument instead of its `attn_mask` argument,
+        #     # in order to dispatch on Flash Attention 2.
+        #     if AttentionMaskConverter._ignore_causal_mask_sdpa(
+        #         attention_mask, inputs_embeds=input_tensor, past_key_values_length=past_seen_tokens
+        #     ):
+        #         return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
         min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
-        if using_static_cache:
-            target_length = past_key_values.get_max_length()
-        else:
+        if hasattr(
+            getattr(self.layers[0], "self_attn", {}), "past_key_value"
+        ):  # static cache
+            target_length = self.config.max_position_embeddings
+        else:  # dynamic cache
             target_length = (
                 attention_mask.shape[-1]
                 if isinstance(attention_mask, torch.Tensor)
-                else past_seen_tokens + sequence_length + 1
+                else (cache_position[-1] + 1 if not is_transformers_attn_greater_or_equal_4_40() else past_seen_tokens + sequence_length + 1)
             )
 
-        if attention_mask is not None and attention_mask.dim() == 4:
-            # in this case we assume that the mask comes already in inverted form and requires no inversion or slicing
-            if attention_mask.max() != 0:
-                raise ValueError("Custom 4D attention mask should be passed in inverted form with max==0`")
-            causal_mask = attention_mask
-        else:
-            causal_mask = torch.full(
-                (sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device
-            )
-            if sequence_length != 1:
-                causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
-            causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
-            if attention_mask is not None:
-                causal_mask = causal_mask.clone()  # copy to contiguous memory for in-place edit
+        causal_mask = torch.zeros(
+            (sequence_length, target_length), dtype=dtype, device=device
+        )  # in original implementation - torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
+        # Commenting out next 2 lines to disable causal masking
+        # if sequence_length != 1:
+        #     causal_mask = torch.triu(causal_mask, diagonal=1)
+        causal_mask *= torch.arange(
+            target_length, device=device
+        ) > cache_position.reshape(-1, 1)
+        causal_mask = causal_mask[None, None, :, :].expand(
+            input_tensor.shape[0], 1, -1, -1
+        )
+        if attention_mask is not None:
+            causal_mask = (
+                causal_mask.clone()
+            )  # copy to contiguous memory for in-place edit
+            if attention_mask.dim() == 2:
                 mask_length = attention_mask.shape[-1]
-                padding_mask = causal_mask[:, :, :, :mask_length] + attention_mask[:, None, None, :]
-                padding_mask = padding_mask == 0
-                causal_mask[:, :, :, :mask_length] = causal_mask[:, :, :, :mask_length].masked_fill(
-                    padding_mask, min_dtype
-                )
+                padding_mask = causal_mask[..., :mask_length].eq(0.0) * attention_mask[
+                    :, None, None, :
+                ].eq(0.0)
+                causal_mask[..., :mask_length] = causal_mask[
+                    ..., :mask_length
+                ].masked_fill(padding_mask, min_dtype)
+            elif attention_mask.dim() == 4:
+                # backwards compatibility: we allow passing a 4D attention mask shorter than the input length with
+                # cache. In that case, the 4D attention mask attends to the newest tokens only.
+                if attention_mask.shape[-2] < cache_position[0] + sequence_length:
+                    offset = cache_position[0]
+                else:
+                    offset = 0
+                mask_shape = attention_mask.shape
+                mask_slice = (attention_mask.eq(0.0)).to(dtype=dtype) * min_dtype
+                causal_mask[
+                    : mask_shape[0],
+                    : mask_shape[1],
+                    offset : mask_shape[2] + offset,
+                    : mask_shape[3],
+                ] = mask_slice
+
         if (
             self.config._attn_implementation == "sdpa"
             and attention_mask is not None
             and attention_mask.device.type == "cuda"
         ):
-            # Attend to all tokens in fully masked rows in the causal_mask, for example the relevant first rows when
-            # using left padding. This is required by F.scaled_dot_product_attention memory-efficient attention path.
-            # Details: https://github.com/pytorch/pytorch/issues/110213
-            causal_mask = AttentionMaskConverter._unmask_unattended(causal_mask, min_dtype)
+            causal_mask = AttentionMaskConverter._unmask_unattended(
+                causal_mask, min_dtype
+            )
 
         return causal_mask
 
 
 # Copied from transformers.models.llama.modeling_llama.LlamaForCausalLM with LLAMA->NEOBERT,Llama->NeoBERT,llama->neobert
-class BertForMaskedLM(NeoBERTPreTrainedModel):
+class NeoBERTorMaskedLM(NeoBERTPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):
@@ -1208,40 +1218,58 @@ class BertForMaskedLM(NeoBERTPreTrainedModel):
             return_dict=return_dict,
             cache_position=cache_position,
         )
-
-        hidden_states = outputs[0]
-        if self.config.pretraining_tp > 1:
-            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
-            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
-            logits = torch.cat(logits, dim=-1)
-        else:
-            logits = self.lm_head(hidden_states)
+        logits = self.lm_head(outputs.hidden_states)
         logits = logits.float()
 
-        loss = None
+        masked_lm_loss = None
         if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            shift_logits = shift_logits.view(-1, self.config.vocab_size)
-            shift_labels = shift_labels.view(-1)
-            # Enable model parallelism
-            shift_labels = shift_labels.to(shift_logits.device)
-            loss = loss_fct(shift_logits, shift_labels)
+            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            masked_lm_loss = loss_fct(logits.view(-1, self.config.vocab_size), labels.view(-1))
 
         if not return_dict:
-            output = (logits,) + outputs[1:]
-            return (loss,) + output if loss is not None else output
+            output = (logits,) + outputs[2:]
+            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
+        return MaskedLMOutput(
+            loss=masked_lm_loss,
+            logits=prediction_scores,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+        # hidden_states = outputs[0]
+        # if self.config.pretraining_tp > 1:
+        #     lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+        #     logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+        #     logits = torch.cat(logits, dim=-1)
+        # else:
+        #     logits = self.lm_head(hidden_states)
+        # logits = logits.float()
+
+        # loss = None
+        # if labels is not None:
+        #     # Shift so that tokens < n predict n
+        #     shift_logits = logits[..., :-1, :].contiguous()
+        #     shift_labels = labels[..., 1:].contiguous()
+        #     # Flatten the tokens
+        #     loss_fct = CrossEntropyLoss()
+        #     shift_logits = shift_logits.view(-1, self.config.vocab_size)
+        #     shift_labels = shift_labels.view(-1)
+        #     # Enable model parallelism
+        #     shift_labels = shift_labels.to(shift_logits.device)
+        #     loss = loss_fct(shift_logits, shift_labels)
+
+        # if not return_dict:
+        #     output = (logits,) + outputs[1:]
+        #     return (loss,) + output if loss is not None else output
+
+        # return CausalLMOutputWithPast(
+        #     loss=loss,
+        #     logits=logits,
+        #     past_key_values=outputs.past_key_values,
+        #     hidden_states=outputs.hidden_states,
+        #     attentions=outputs.attentions,
+        # )
 
     def prepare_inputs_for_generation(
         self,
